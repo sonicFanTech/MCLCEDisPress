@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "MCLCE Discord Presence"
 APP_SHORT_NAME = "MCLCEDisPres"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "sonic Fan Tech"
 APP_COPYRIGHT = "Copyright (c) sonic Fan Tech"
 APP_LICENSE = "MIT License"
@@ -49,6 +49,8 @@ settings_window = None
 about_window = None
 settings_vars = {}
 last_game_launch_time = 0.0
+auto_close_after_game_seen = False
+shutdown_requested = False
 
 stop_event = threading.Event()
 lock = threading.Lock()
@@ -105,6 +107,7 @@ def load_config():
         "game_exe_path": DEFAULT_GAME_EXE_PATH,
         "game_launch_args": DEFAULT_GAME_LAUNCH_ARGS,
         "launch_cooldown_seconds": str(DEFAULT_LAUNCH_COOLDOWN),
+        "auto_close_after_game_closes": "true",
     }
     cfg["Presence"] = {
         "details": DEFAULT_DETAILS,
@@ -179,6 +182,10 @@ def should_start_paused() -> bool:
 
 def should_open_discord_on_start() -> bool:
     return cfg_get_bool("General", "open_discord_on_start", False)
+
+
+def should_auto_close_after_game_closes() -> bool:
+    return cfg_get_bool("General", "auto_close_after_game_closes", True)
 
 
 def startup_enabled() -> bool:
@@ -442,7 +449,7 @@ def reconnect_rpc():
 
 
 def launch_game():
-    global last_game_launch_time
+    global last_game_launch_time, auto_close_after_game_seen
     path = game_exe_path()
     args = game_launch_args()
 
@@ -470,6 +477,7 @@ def launch_game():
         if args:
             command.extend(shlex.split(args, posix=False))
         subprocess.Popen(command, cwd=os.path.dirname(path) or None)
+        auto_close_after_game_seen = True
         last_game_launch_time = now
         set_status(f"Launched game: {os.path.basename(path)}", notify=True)
         return True, "Game launched."
@@ -509,8 +517,45 @@ def run_test_presence(parent=None):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+
+
+def request_exit(reason: str = ""):
+    global tray_icon, shutdown_requested
+    if shutdown_requested:
+        return
+    shutdown_requested = True
+    if reason:
+        set_status(reason, notify=False)
+    stop_event.set()
+    try:
+        clear_presence()
+    except Exception:
+        pass
+    disconnect_rpc()
+    try:
+        if settings_window is not None:
+            settings_window.after(0, settings_window.destroy)
+    except Exception:
+        pass
+    try:
+        if about_window is not None:
+            about_window.after(0, about_window.destroy)
+    except Exception:
+        pass
+    try:
+        if tray_icon is not None:
+            tray_icon.visible = False
+    except Exception:
+        pass
+    try:
+        if tray_icon is not None:
+            tray_icon.stop()
+    except Exception:
+        pass
+
+
 def watcher_loop():
-    global presence_active, minecraft_running_last
+    global presence_active, minecraft_running_last, auto_close_after_game_seen
     set_status(f"Watching for {target_exe_name()}...", notify=False)
 
     while not stop_event.is_set():
@@ -535,6 +580,7 @@ def watcher_loop():
                     set_presence()
                     presence_active = True
                     minecraft_running_last = True
+                    auto_close_after_game_seen = True
                     set_status("Minecraft PC Port detected. Presence enabled.", notify=True)
                 except Exception as e:
                     disconnect_rpc()
@@ -546,6 +592,9 @@ def watcher_loop():
                 disconnect_rpc()
                 presence_active = False
                 minecraft_running_last = False
+                if should_auto_close_after_game_closes() and auto_close_after_game_seen:
+                    request_exit("Minecraft PC Port closed. Auto-closing Discord Presence...")
+                    break
                 set_status("Minecraft PC Port closed. Presence cleared.", notify=True)
 
             elif running and presence_active:
@@ -644,6 +693,7 @@ def apply_settings_from_window(window):
         config.set("General", "check_interval", str(check_interval))
         config.set("General", "start_paused", "true" if settings_vars["start_paused"].get() else "false")
         config.set("General", "open_discord_on_start", "true" if settings_vars["open_discord_on_start"].get() else "false")
+        config.set("General", "auto_close_after_game_closes", "true" if settings_vars["auto_close_after_game_closes"].get() else "false")
         config.set("General", "game_exe_path", game_path)
         config.set("General", "game_launch_args", game_args)
         config.set("General", "launch_cooldown_seconds", str(cooldown))
@@ -722,6 +772,7 @@ def open_settings_window():
             "start_paused": tk.BooleanVar(value=cfg_get_bool("General", "start_paused", False)),
             "start_with_windows": tk.BooleanVar(value=startup_enabled()),
             "open_discord_on_start": tk.BooleanVar(value=cfg_get_bool("General", "open_discord_on_start", False)),
+            "auto_close_after_game_closes": tk.BooleanVar(value=cfg_get_bool("General", "auto_close_after_game_closes", True)),
             "game_exe_path": tk.StringVar(value=cfg_get("General", "game_exe_path", DEFAULT_GAME_EXE_PATH)),
             "game_launch_args": tk.StringVar(value=cfg_get("General", "game_launch_args", DEFAULT_GAME_LAUNCH_ARGS)),
             "details": tk.StringVar(value=cfg_get("Presence", "details", DEFAULT_DETAILS)),
@@ -775,12 +826,13 @@ def open_settings_window():
         ttk.Checkbutton(tab_general, text="Start paused", variable=settings_vars["start_paused"]).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Checkbutton(tab_general, text="Start with Windows", variable=settings_vars["start_with_windows"]).grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Checkbutton(tab_general, text="Open Discord on start", variable=settings_vars["open_discord_on_start"]).grid(row=12, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(tab_general, text="Auto-close after game closes", variable=settings_vars["auto_close_after_game_closes"]).grid(row=13, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         def launch_from_settings():
             if apply_settings_from_window(root):
                 launch_game()
 
-        ttk.Button(tab_general, text="Launch Game Now", command=launch_from_settings).grid(row=13, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(tab_general, text="Launch Game Now", command=launch_from_settings).grid(row=14, column=0, sticky="w", pady=(12, 0))
 
         ttk.Label(tab_presence, text="Details text:").grid(row=0, column=0, sticky="w", pady=(0, 6))
         ttk.Entry(tab_presence, textvariable=settings_vars["details"]).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 12))
@@ -865,6 +917,7 @@ def open_about_window():
             "- Updates Discord Rich Presence automatically\n"
             "- Can launch the game from the tray or settings window\n"
             "- Starts Discord automatically before reconnecting RPC when needed\n"
+            "- Can auto-close itself after the game closes\n"
             "- Supports auto-start, auto icon detection, configurable text, and test presence\n"
         )
         ttk.Label(frame, text=about_text, justify="left", wraplength=520).pack(anchor="w")
@@ -905,30 +958,9 @@ def on_open_about(icon, _item):
 
 
 def on_exit(icon, _item):
-    global presence_active, settings_window, about_window
-    stop_event.set()
-    try:
-        if presence_active:
-            clear_presence()
-    except Exception:
-        pass
-    disconnect_rpc()
+    global presence_active
     presence_active = False
-    try:
-        if settings_window is not None:
-            settings_window.after(0, settings_window.destroy)
-    except Exception:
-        pass
-    try:
-        if about_window is not None:
-            about_window.after(0, about_window.destroy)
-    except Exception:
-        pass
-    try:
-        icon.visible = False
-    except Exception:
-        pass
-    icon.stop()
+    request_exit("Exiting...")
 
 
 def is_paused_checked(_item):
@@ -951,10 +983,11 @@ def build_menu():
 
 
 def initialize_runtime_settings():
-    global monitoring_paused
+    global monitoring_paused, auto_close_after_game_seen
     load_config()
     sync_startup_setting_in_config()
     monitoring_paused = should_start_paused()
+    auto_close_after_game_seen = False
     if should_open_discord_on_start():
         try:
             open_discord(show_status=False)
